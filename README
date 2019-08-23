@@ -1,0 +1,66 @@
+This is an unofficial agent for the Stackdriver Profiler[1] that makes
+tunable perf_events[2] profiles available in the Google Cloud console. It
+uses perf_data_converter to convert `perf.data` results into the `pprof`
+format expected by the StackDriver profiler.
+
+Profiles can be collected at the cadence established by the Stackdriver
+profiler, or they can be collected manually (this is called "offline"
+mode). Once they are uploaded, the profilers can be viewed as call graphs
+or flame graphs or any other visualization supported by the product.
+
+
+BUILD
+
+bazel build :sd_perf_agent
+
+A container image target for use in containerized environments is provided
+as well.
+
+INSTALL
+
+The build steps create a statically linked binary that can be copied
+into your location of choice for running binaries. The scripts/ directory
+contains supporting files to run this program in various ways:
+
+* A systemd unit file is provided to run under Linux distributions using systemd
+* A shell script for use under daemontools/runit-style init systems
+* A kubernetes daemon set for deployment into a kubernetes cluster
+
+Additional contributions in this area are welcome. Please review the
+scripts before deploying to your environment. Caveat emptor, etc.
+
+CONFIGURE
+
+When run from within GCP, the agent should need no additional
+configuration to start providing useful profiles.
+
+* The agent tries to use application default credentials[5] to talk to
+  the profiler API.
+* If running from a GCE instance, additional information such as
+  zone and cpu platform are taken from the metadata server and provided
+  as labels to the profiler API.
+
+The default behavior can be overridden by command-line flags. Run
+`sd_perf_agent --help` for a list of available commands.
+
+USING A CUSTOM PERF COMMAND
+
+By default, the following perf command is run to obtain a system-wide
+profile:
+
+	perf record -F 99 -ag -- sleep $DURATION
+
+where $DURATION is dictated by the stackdriver profiler API. Alternate
+perf invocations can be provided after the options. For example, to restrict
+the profile to a specific process and a specific tracepoint, run
+
+	sd_perf_agent -- perf record 
+
+The only restriction on the perf command is that it must write its output to `perf.data` in
+the current directory.
+
+[1]: https://cloud.google.com/profiler/
+[2]: http://www.brendangregg.com/perf.html
+[3]: https://github.com/google/perf_data_converter
+[4]: https://cloud.google.com/profiler/docs/using-profiler
+[5]: https://cloud.google.com/docs/authentication/production#finding_credentials_automatically
