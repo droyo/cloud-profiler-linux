@@ -1,13 +1,13 @@
 load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
 load("@bazel_gazelle//:def.bzl", "gazelle")
 
-# gazelle:prefix github.com/droyo/stackdriver-profiler-perf
+# gazelle:prefix github.com/droyo/cloud-profiler-perf
 gazelle(name = "gazelle")
 
 go_library(
     name = "go_default_library",
     srcs = ["main.go"],
-    importpath = "github.com/droyo/stackdriver-profiler-perf",
+    importpath = "github.com/droyo/cloud-profiler-perf",
     visibility = ["//visibility:private"],
     deps = [
         "@com_github_golang_protobuf//proto:go_default_library",
@@ -24,7 +24,7 @@ go_library(
 )
 
 go_binary(
-    name = "sd_perf_agent",
+    name = "cloud-profiler-perf-record",
     embed = [":go_default_library"],
     visibility = ["//visibility:public"],
 )

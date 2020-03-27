@@ -4,16 +4,17 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"html/template"
-	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
+	"text/template"
 	"time"
 
 	"google.golang.org/grpc"
@@ -31,13 +32,11 @@ import (
 )
 
 var (
-	serverAddr     = flag.String("api", "cloudprofiler.googleapis.com:443", "host:port of cloud profiler API")
-	credsJSON      = flag.String("credentials-json", "", "service account credentials JSON file")
-	cloudProject   = flag.String("project", "", "Google Cloud project ID")
-	service        = flag.String("service", "", "Service name")
-	enablePerfMem  = flag.Bool("enable-perf-mem", false, "enable memory profiles with `perf mem`")
-	enablePerfLock = flag.Bool("enable-perf-lock", false, "enable lock profiles with `perf lock`")
-	onerun         = flag.String("onerun", false, "upload a profile immediately and exit.")
+	serverAddr   = flag.String("api", "cloudprofiler.googleapis.com:443", "host:port of cloud profiler API")
+	credsJSON    = flag.String("credentials", "", "service account credentials JSON file")
+	cloudProject = flag.String("project", "", "Google Cloud project ID")
+	service      = flag.String("service", "", "Service name")
+	runForever   = flag.Bool("run-forever", false, "Collect profiles indefinitely according to Cloud Profiler's cadence")
 )
 
 var (
@@ -47,7 +46,8 @@ var (
 )
 
 const (
-	defaultProfileDuration = time.Second * 10
+	defaultProfileDuration = time.Second * 5
+	maxRequestAttempts     = 10
 )
 
 // Currently the best documentation for the agent <-> profiler API protocol
@@ -57,81 +57,94 @@ const (
 
 type agent struct {
 	cloudprofiler.ProfilerServiceClient
-	ctx           context.Context
-	cpuProfile    *exec.Cmd
-	memProfile    *exec.Cmd
-	lockProfile   *exec.Cmd
-	threadProfile *exec.Cmd
-	service       string
-	project       string
-	labels        map[string]string
+	addr    string
+	tmpdir  string
+	ctx     context.Context
+	perf    *exec.Cmd
+	service string
+	project string
+	labels  map[string]string
 }
 
 func main() {
 	flag.Parse()
+	log.Fatal(cloudPerfProfiler())
+}
+
+func cloudPerfProfiler() error {
 	var creds credentials.PerRPCCredentials
 	var err error
+	var agent agent
 
-	ctx := context.Background()
+	agent.ctx = context.Background()
 
-	if *credsJSON != "" {
-		creds, err = oauth.NewServiceAccountFromFile(*credsJSON, requiredScopes...)
-		if err != nil {
-			log.Fatal("failed to load JSON key: ", err)
-		}
-	} else {
-		creds, err = oauth.NewApplicationDefault(ctx, requiredScopes...)
-		if err != nil {
-			log.Fatal("failed to load application default credentials: ", err)
-		}
-	}
-
-	log.Println("connecting to ", *serverAddr, "...")
-	conn, err := grpc.DialContext(ctx, *serverAddr,
-		grpc.WithPerRPCCredentials(creds),
-		grpc.WithBlock(),
-		grpc.WithTransportCredentials(credentials.NewTLS(nil)))
-	defer conn.Close()
-
-	if err != nil {
-		log.Fatalf("error dialing %s: %s", *serverAddr, err)
-	}
-	log.Printf("connected to %s in status %s", conn.Target(), conn.GetState())
-	agent := agent{
-		ProfilerServiceClient: cloudprofiler.NewProfilerServiceClient(conn),
-		ctx: ctx,
-	}
-	if *enablePerfMem {
-		agent.memProfile = exec.Command("perf", "mem", "record", "sleep", "{{ .Duration.Seconds }}")
-	}
-	if *enablePerfLock {
-		agent.lockProfile = exec.Command("perf", "lock", "record", "sleep", "{{ .Duration.Seconds }}")
-	}
 	if flag.NArg() > 0 {
-		agent.cpuProfile = exec.Command(flag.Arg(0), flag.Args()[1:]...)
+		agent.perf = exec.Command("perf", append([]string{"record"}, flag.Args()...)...)
 	} else {
-		agent.cpuProfile = exec.Command("perf", "record", "-ag", "-F", "99", "sleep", "{{ .Duration.Seconds }}")
-	}
-	if *cloudProject != "" {
-		agent.project = *cloudProject
-	} else {
-		if project, err := inferCloudProject(creds, conn); err != nil {
-			log.Fatal("could not determine project: ", err)
-		} else {
-			agent.project = project
-		}
+		agent.perf = exec.Command("perf", "record", "-ag", "-F", "99", "--", "sleep", "{{ .Duration.Seconds }}")
 	}
 
 	if *service != "" {
 		agent.service = *service
 	} else {
 		if service, err := inferService(); err != nil {
-			log.Fatal("could not determine service: ", err)
+			return fmt.Errorf("could not determine service: %s", err)
 		} else {
+			log.Println("inferring service as", service)
 			agent.service = service
 		}
 	}
-	log.Fatal(agent.run())
+
+	if tmpdir, err := ioutil.TempDir("", filepath.Base(os.Args[0])); err != nil {
+		return fmt.Errorf("failed to create temp directory: %s", err)
+	} else {
+		log.Println("using temporary directory", tmpdir)
+		agent.tmpdir = tmpdir
+		defer os.RemoveAll(tmpdir)
+	}
+
+	if err := os.Chdir(agent.tmpdir); err != nil {
+		return err
+	}
+
+	if *credsJSON != "" {
+		creds, err = oauth.NewServiceAccountFromFile(*credsJSON, requiredScopes...)
+		if err != nil {
+			return fmt.Errorf("failed to load JSON key: %s", err)
+		}
+	} else {
+		creds, err = oauth.NewApplicationDefault(agent.ctx, requiredScopes...)
+		if err != nil {
+			return fmt.Errorf("failed to load application default credentials: %s", err)
+		}
+	}
+
+	log.Println("connecting to", *serverAddr, "...")
+	conn, err := grpc.DialContext(agent.ctx, *serverAddr,
+		grpc.WithPerRPCCredentials(creds),
+		grpc.WithBlock(),
+		grpc.WithTransportCredentials(credentials.NewTLS(nil)))
+	defer conn.Close()
+
+	if err != nil {
+		return fmt.Errorf("error dialing %s: %s", *serverAddr, err)
+	}
+	agent.addr = conn.Target()
+	log.Printf("connected to %s in status %s", conn.Target(), conn.GetState())
+	agent.ProfilerServiceClient = cloudprofiler.NewProfilerServiceClient(conn)
+
+	if *cloudProject != "" {
+		agent.project = *cloudProject
+	} else {
+		if project, err := inferCloudProject(creds, conn); err != nil {
+			return fmt.Errorf("could not determine project: %s", err)
+		} else {
+			log.Println("inferred project is", project)
+			agent.project = project
+		}
+	}
+
+	return agent.run()
 }
 
 func inferService() (string, error) {
@@ -148,12 +161,14 @@ func (a *agent) run() error {
 		if err != nil {
 			return fmt.Errorf("CreateProfile failed: %s", err)
 		}
+		log.Printf("%s profile requested", profile.ProfileType)
 		if err := a.retrieveProfile(profile); err != nil {
-			log.Printf("could not retrieve profile: %s", err)
-			continue
+			return fmt.Errorf("could not collect perf profile: %s", err)
 		}
 		if err := a.tryUpdateProfile(profile); err != nil {
 			log.Printf("failed to update profile %s: %s", profile.Name, err)
+		} else {
+			log.Printf("uploaded %s profile %s", profile.ProfileType, profile.Name)
 		}
 	}
 	return nil
@@ -167,28 +182,32 @@ func (a *agent) tryCreateProfile() (*cloudprofiler.Profile, error) {
 			Target:    a.service,
 			Labels:    a.labels,
 		},
-		ProfileType: a.supportedProfileTypes(),
+		ProfileType: []cloudprofiler.ProfileType{
+			cloudprofiler.ProfileType_CPU,
+		},
 	}
 	md := metadata.New(map[string]string{})
 
-	log.Printf("retrieving profile lease from %s", *serverAddr)
+	log.Printf("waiting for profile request from %s", a.addr)
 
 	var (
 		attempt int
 		backoff time.Duration
+		profile *cloudprofiler.Profile
+		err     error
 	)
 
-	for {
-		profile, err := a.CreateProfile(a.ctx, req, grpc.Trailer(&md))
+	for attempt < maxRequestAttempts {
+		profile, err = a.CreateProfile(a.ctx, req, grpc.Trailer(&md))
 
 		if err == nil {
 			return profile, nil
 		}
 		attempt++
 		if temporaryError(err) {
-			if d, ok := retryError(err); ok {
+			if d, ok := retryError(err, md); ok {
 				backoff = d
-				log.Println("CreateProfile failed: %s, retrying using server-advised delay of %v", d)
+				log.Printf("CreateProfile failed: %s, retrying using server-advised delay of %v", err, d)
 			} else {
 				backoff = retryBackoff(attempt)
 				log.Printf("CreateProfile failed: %s, retrying in %v", err, backoff)
@@ -198,6 +217,20 @@ func (a *agent) tryCreateProfile() (*cloudprofiler.Profile, error) {
 			return nil, err
 		}
 	}
+	return nil, fmt.Errorf("CreateProfile max retries(%d) exceeded; last error: %s",
+		maxRequestAttempts, err)
+}
+
+func retryBackoff(attempt int) time.Duration {
+	const max = time.Second * 300
+	backoff := time.Second
+	for i := 0; i < attempt; i++ {
+		backoff *= 2
+	}
+	if backoff > max {
+		return max
+	}
+	return backoff
 }
 
 func temporaryError(err error) bool {
@@ -212,19 +245,19 @@ func temporaryError(err error) bool {
 	return false
 }
 
-func retryError(err error) (time.Duration, bool) {
+func retryError(err error, md metadata.MD) (time.Duration, bool) {
 	var retryInfo errdetails.RetryInfo
+
 	if s, ok := status.FromError(err); ok && s.Code() == codes.Aborted {
 		pb := md.Get("google.rpc.retryinfo-bin")
 		if len(pb) > 0 {
-			if err := proto.Unmarshal(pb[0], &retryInfo); err != nil {
+			if err := proto.Unmarshal([]byte(pb[0]), &retryInfo); err != nil {
 				log.Printf("failed to read retry trailer: %s", err)
 			} else {
 				d, err := ptypes.Duration(retryInfo.RetryDelay)
 				if err != nil {
 					log.Printf("could not parse retry delay: %s", err)
 				} else {
-					backoff = d
 					return d, true
 				}
 			}
@@ -234,30 +267,32 @@ func retryError(err error) (time.Duration, bool) {
 }
 
 func (a *agent) retrieveProfile(profile *cloudprofiler.Profile) error {
-	var perfCmd *exec.Cmd
+	if profile.ProfileType != cloudprofiler.ProfileType_CPU {
+		return fmt.Errorf("server asked for unsupported profile type %s",
+			profile.ProfileType)
+	}
 
-	switch profile.ProfileType {
-	case cloudprofiler.ProfileType_CPU:
-		if a.cpuProfile != nil {
-			perfCmd = a.cpuProfile
-		}
-	case cloudprofiler.ProfileType_HEAP:
-		if a.memProfile != nil {
-			perfCmd = a.memProfile
-		}
-	case cloudprofiler.ProfileType_CONTENTION:
-		if a.lockProfile != nil {
-			perfCmd = a.lockProfile
-		}
-	case cloudprofiler.ProfileType_THREADS:
-		if a.threadProfile != nil {
-			perfCmd = a.threadProfile
-		}
+	cmd := preparePerfCommand(a.perf, profile)
+	timeout, err := ptypes.Duration(profile.Duration)
+	if err != nil {
+		timeout = defaultProfileDuration
 	}
-	if perfCmd != nil {
-		return perfToProfile(profile, perfCmd)
+	if err := runPerfCommand(cmd, timeout); err != nil {
+		return err
 	}
-	return fmt.Errorf("unsupported profile type %s", profile.ProfileType)
+	if err := buildSymbolLookup("binaries", "perf.data"); err != nil {
+		return err
+	}
+	if err := perfToPprof("perf.pprof", "perf.data", "binaries"); err != nil {
+		return err
+	}
+	if pprofBytes, err := ioutil.ReadFile("perf.pprof"); err != nil {
+		return err
+	} else {
+		profile.ProfileBytes = pprofBytes
+	}
+	return nil
+
 }
 
 func (a *agent) tryUpdateProfile(profile *cloudprofiler.Profile) error {
@@ -266,22 +301,6 @@ func (a *agent) tryUpdateProfile(profile *cloudprofiler.Profile) error {
 	}
 	_, err := a.UpdateProfile(a.ctx, req)
 	return err
-}
-
-func (a *agent) supportedProfileTypes() (supported []cloudprofiler.ProfileType) {
-	if a.cpuProfile != nil {
-		append(supported, cloudprofiler.ProfileType_CPU)
-	}
-	if a.threadProfile != nil {
-		append(supported, cloudprofiler.ProfileType_THREAD)
-	}
-	if a.memProfile != nil {
-		append(supported, cloudprofiler.ProfileType_HEAP)
-	}
-	if a.lockProfile != nil {
-		append(supported, cloudprofiler.ProfileType_CONTENTION)
-	}
-	return supported
 }
 
 // Returns copy of cmd with template variables replaced from profile. Cannot be called after cmd is
@@ -294,17 +313,15 @@ func preparePerfCommand(cmd *exec.Cmd, profile *cloudprofiler.Profile) *exec.Cmd
 		Duration time.Duration
 	}
 	params.Profile = profile
-	params.Duration, err = ptypes.Duration(profile.Profile.Duration)
+	params.Duration, err = ptypes.Duration(profile.Duration)
 	if err != nil {
 		log.Printf("could not parse duration from profile: %s, using default %v", err, defaultProfileDuration)
 		params.Duration = defaultProfileDuration
 	}
 
-	t := template.New("arg")
 	newCmd := new(exec.Cmd)
-
 	*newCmd = *cmd
-	newCmd.Args = append([]string, cmd.Args...)
+	newCmd.Args = append([]string{}, cmd.Args...)
 
 	if len(newCmd.Args) == 0 {
 		return newCmd
@@ -312,12 +329,14 @@ func preparePerfCommand(cmd *exec.Cmd, profile *cloudprofiler.Profile) *exec.Cmd
 
 	var buf bytes.Buffer
 	for i, arg := range newCmd.Args {
-		t, err := t.Parse(arg)
+		t, err := template.New("arg").Parse(arg)
 		if err != nil {
+			log.Printf("failed to parse arg %q as template: %s", arg, err)
 			continue
 		}
 		buf.Reset()
-		if err := t.Exec(&buf, params); err != nil {
+		if err := t.Execute(&buf, params); err != nil {
+			log.Printf("substitute %q failed: %s", arg)
 			continue
 		}
 		newCmd.Args[i] = buf.String()
@@ -325,24 +344,16 @@ func preparePerfCommand(cmd *exec.Cmd, profile *cloudprofiler.Profile) *exec.Cmd
 	return newCmd
 }
 
-func perfToProfile(profile *cloudprofiler.Profile, cmd *exec.Cmd) error {
-	cmd = preparePerfCommand(cmd, profile)
-	timeout, err := ptypes.Duration(profile.Duration)
-	if err != nil {
-		timeout = defaultProfileDuration
-	}
-	if err := runPerfCommand(cmd, timeout); err != nil {
-		return err
-	}
-	pprofBytes, err := perfToPprofGzip("perf.data")
-	if err != nil {
-		return err
-	}
-	profile.ProfileBytes = pprofBytes
-	return nil
-}
-
+// Runs perf with a timeout. This is useful if the perf command provided does
+// not terminate, for instance if we are profiling a specific process.
 func runPerfCommand(cmd *exec.Cmd, timeout time.Duration) error {
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	log.Printf("running %q", cmd.Args)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("Command %q failed: %s; %s", cmd.Args, err)
+	}
 	time.AfterFunc(timeout, func() {
 		if cmd.Process != nil {
 			log.Printf("sending INT signal to process %d after %v", cmd.Process.Pid, timeout)
@@ -352,15 +363,15 @@ func runPerfCommand(cmd *exec.Cmd, timeout time.Duration) error {
 		}
 	})
 
-	log.Printf("running %q", cmd.Args)
-	err := cmd.Run()
+	err := cmd.Wait()
 	if err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
-			// perf will exit with status code 130 if it is interrupted
-			if exit.ExitCode() == 130 {
+			if exit.ExitCode() == -1 {
+				// the process terminated from a signal
 				return nil
 			} else {
-				return fmt.Errorf("Command %q failed: %s; %s", cmd.Args, err, string(exit.Stderr))
+				return fmt.Errorf("Command %q failed: exit status %d; %s",
+					cmd.Args, exit.ExitCode(), stderr.String())
 			}
 		} else {
 			return fmt.Errorf("Failed to run perf: %s", err)
@@ -369,39 +380,81 @@ func runPerfCommand(cmd *exec.Cmd, timeout time.Duration) error {
 	return nil
 }
 
-func perfToPprofGzip(src string) ([]byte, error) {
-	var buf bytes.Buffer
-	var gzipErr error
+// In order to properly symbolize the resulting pprof proto, perf_to_data
+// needs to find the debug symbols. To do this, it searches
+// $PPROF_BINARY_PATH. This function constructs a tree of symlinks to help
+// pprof find the symbols.
+// https://github.com/google/pprof/blob/1ebb73c60ed3b70bd749d4f798d7ae427263e2c5/doc/README.md#annotated-code
+func buildSymbolLookup(dst, perfData string) error {
+	var n int
+	cmd := exec.Command("perf", "buildid-list", perfData)
+	output, err := cmd.Output()
 
-	gzipCompleted := make(chan struct{})
-
-	cmd := exec.Command("perf_to_profile", "-i", src, "-o", "/dev/stdout")
-	r, err := cmd.StdoutPipe()
+	log.Printf("building pprof symbol lookup tree from %s", perfData)
 	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	w := gzip.NewWriter(&buf)
-
-	go func() {
-		_, gzipErr = io.Copy(&profileBuffer)
-		w.Close()
-		close(gzipCompleted)
-	}()
-
-	if err := cmd.Wait(); err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("Command %q failed: %s; %s", cmd.Args, err, string(exit.Stderr))
-		} else {
-			return nil, fmt.Errorf("Failed to run  %q: %s", cmd.Args, err)
+			return fmt.Errorf("perf build-id list failed: %s; %s", err, exit.Stderr)
 		}
 	}
-	<-gzipCompleted
-	if gzipErr != nil {
-		return nil, fmt.Errorf("gzip of pprof data failed: %s", gzipErr)
+
+	for _, line := range strings.Split(string(output), "\n") {
+		if len(line) == 0 {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			log.Printf("skipping buildid-list output %q", line)
+			continue
+		}
+		buildid := fields[0]
+		symbols := fields[1]
+		binary := filepath.Base(fields[1])
+
+		// the kernel symbols are a special case
+		if strings.HasPrefix(binary, "vmlinux") {
+			binary = "vmlinux"
+		}
+
+		if err := os.MkdirAll(filepath.Join(dst, buildid), 0777); err != nil {
+			return err
+		}
+
+		err := os.Symlink(symbols, filepath.Join(dst, buildid, binary))
+		if err != nil && !os.IsExist(err) {
+			return err
+		}
+		n++
 	}
-	return buf.Bytes(), nil
+	log.Printf("linked debug symbols for %d binaries", n)
+	return nil
+}
+
+func perfToPprof(dst, src, symbols string) error {
+	const maxErrorOutput = 200
+
+	var stderr bytes.Buffer
+
+	// We call pprof instead of calling perf_to_profile because pprof will
+	// annotate the profile with symbols.
+	cmd := exec.Command("pprof", "-symbolize=force", "-proto", "-output", dst, src)
+	cmd.Env = append(cmd.Env,
+		"PPROF_BINARY_PATH="+filepath.Join(".", symbols),
+		// pprof calls perf_to_profile which must be in path
+		os.ExpandEnv("PATH=$PATH"),
+	)
+	cmd.Stderr = &stderr
+
+	log.Printf("converting %s to pprof format", src)
+	if err := cmd.Run(); err != nil {
+		if _, ok := err.(*exec.ExitError); ok {
+			errOut := stderr.String()
+			if len(errOut) > maxErrorOutput {
+				errOut = "... " + errOut[len(errOut)-maxErrorOutput:]
+			}
+			return fmt.Errorf("Command %q failed: %s; %s", cmd.Args, err, errOut)
+		} else {
+			return fmt.Errorf("Failed to run  %q: %s", cmd.Args, err)
+		}
+	}
+	return nil
 }

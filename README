@@ -1,13 +1,16 @@
-This is an unofficial agent for the Stackdriver Profiler[1] that makes
-tunable perf_events[2] profiles available in the Google Cloud console. It
-uses perf_data_converter to convert `perf.data` results into the `pprof`
-format expected by the StackDriver profiler.
+This is an unofficial agent for the Cloud Profiler[1] that makes
+tunable perf_events[2] profiles available in the Google Cloud console.
+It is a wrapper for the `perf record` command that converts its output
+to the format expected by the cloud profiler and uploads it using the
+credentials provided via command line or in the GCE metadata server.
 
-Profiles can be collected at the cadence established by the Stackdriver
-profiler, or they can be collected manually (this is called "offline"
-mode). Once they are uploaded, the profilers can be viewed as call graphs
+By default, the `cloud-profiler-perf-record` command runs once, and
+uploads a single profile (this is called "offline" mode). The
+--run-forever flag will cause the command to run forever, and collect
+profiles at the cadence established by the Cloud Profiler service.
+
+Once they are uploaded, the profiles can be viewed as call graphs
 or flame graphs or any other visualization supported by the product.
-
 
 BUILD
 
@@ -34,33 +37,32 @@ CONFIGURE
 When run from within GCP, the agent should need no additional
 configuration to start providing useful profiles.
 
-* The agent tries to use application default credentials[5] to talk to
+* The agent tries to use application default credentials[3] to talk to
   the profiler API.
 * If running from a GCE instance, additional information such as
   zone and cpu platform are taken from the metadata server and provided
   as labels to the profiler API.
 
 The default behavior can be overridden by command-line flags. Run
-`sd_perf_agent --help` for a list of available commands.
+`cloud-profiler-perf-record --help` for a list of available options.
 
 USING A CUSTOM PERF COMMAND
 
 By default, the following perf command is run to obtain a system-wide
 profile:
 
-	perf record -F 99 -ag -- sleep $DURATION
+	perf record -F 99 -ag -- sleep '{{ .Duration.Seconds }}'
 
-where $DURATION is dictated by the stackdriver profiler API. Alternate
-perf invocations can be provided after the options. For example, to restrict
-the profile to a specific process and a specific tracepoint, run
+where '{{ .Duration.Seconds }}' is replaced by a duration provided by
+the cloud profiler API. The command acts as a drop-in replacement for
+`perf record`, so any additional arguments can be passed to customize
+the profile.
 
-	sd_perf_agent -- perf record 
+	cloud-profiler-perf-record -- -F 99 -ag -- sleep '{{ .Duration.Seconds }}'
 
-The only restriction on the perf command is that it must write its output to `perf.data` in
-the current directory.
+The only restrictions on the perf command is that it must write its output
+to `perf.data` in the current directory.
 
 [1]: https://cloud.google.com/profiler/
 [2]: http://www.brendangregg.com/perf.html
-[3]: https://github.com/google/perf_data_converter
-[4]: https://cloud.google.com/profiler/docs/using-profiler
-[5]: https://cloud.google.com/docs/authentication/production#finding_credentials_automatically
+[3]: https://cloud.google.com/docs/authentication/production#finding_credentials_automatically
