@@ -1,12 +1,10 @@
-This is an unofficial agent for the Cloud Profiler[1] that makes
+This is a proof-of-concept agent for the Cloud Profiler[1] that makes
 tunable perf_events[2] profiles available in the Google Cloud console.
 It is a wrapper for the `perf record` command that converts its output
 to the format expected by the cloud profiler and uploads it using the
-credentials provided via command line or in the GCE metadata server.
+credentials provided via command line.
 
-By default, the `cloud-profiler-perf-record` command runs once, and
-uploads a single profile (this is called "offline" mode). The
---run-forever flag will cause the command to run forever, and collect
+The `cloud-profiler-perf-record` command runs forever, collecting
 profiles at the cadence established by the Cloud Profiler service.
 
 Once they are uploaded, the profiles can be viewed as call graphs
@@ -14,37 +12,37 @@ or flame graphs or any other visualization supported by the product.
 
 BUILD
 
-bazel build :sd_perf_agent
+bazel build :cloud-profiler-perf-record
 
-A container image target for use in containerized environments is provided
-as well.
+The command requires the pprof[1] and perf_to_profile[2] commands to
+be in its $PATH.
 
-INSTALL
+To create useful traces, the agent requires debug symbols. The agent
+attempts to use the `perf buildid-list` command to discover symbols
+automatically.
 
-The build steps create a statically linked binary that can be copied
-into your location of choice for running binaries. The scripts/ directory
-contains supporting files to run this program in various ways:
+On debian/ubuntu, ensure you have the relevant `-dbgsym` packages
+installed for the applications you want to monitor.
 
-* A systemd unit file is provided to run under Linux distributions using systemd
-* A shell script for use under daemontools/runit-style init systems
-* A kubernetes daemon set for deployment into a kubernetes cluster
+[1]: https://github.com/google/pprof
+[2]: https://github.com/google/perf_to_profile
 
-Additional contributions in this area are welcome. Please review the
-scripts before deploying to your environment. Caveat emptor, etc.
+RUN
 
-CONFIGURE
+`cloud-profiler-perf-record` is configured to run using service account
+credentials[3]. It us run like so:
 
-When run from within GCP, the agent should need no additional
-configuration to start providing useful profiles.
+	cloud-profiler-perf-record \
+		--credentials path/to/credentials.json \
+		--project my-project-id \
+		--service my-service-name
 
-* The agent tries to use application default credentials[3] to talk to
-  the profiler API.
-* If running from a GCE instance, additional information such as
-  zone and cpu platform are taken from the metadata server and provided
-  as labels to the profiler API.
+If `--service` will be the name of the service in cloud profiler. Agents
+using the same service name will get profile requests at a reduced rate
+proportional to the number of agents. If `--service` is not provided,
+the instance's hostname is used.
 
-The default behavior can be overridden by command-line flags. Run
-`cloud-profiler-perf-record --help` for a list of available options.
+[3]: https://cloud.google.com/iam/docs/creating-managing-service-account-keys
 
 USING A CUSTOM PERF COMMAND
 
@@ -54,11 +52,11 @@ profile:
 	perf record -F 99 -ag -- sleep '{{ .Duration.Seconds }}'
 
 where '{{ .Duration.Seconds }}' is replaced by a duration provided by
-the cloud profiler API. The command acts as a drop-in replacement for
-`perf record`, so any additional arguments can be passed to customize
-the profile.
+the cloud profiler API, typically 10 seconds. The command acts as a
+drop-in replacement for `perf record`, so any additional arguments can
+be passed to customize the profile.
 
-	cloud-profiler-perf-record -- -F 99 -ag -- sleep '{{ .Duration.Seconds }}'
+	cloud-profiler-perf-record -- -p $(pidof mysqld)
 
 The only restrictions on the perf command is that it must write its output
 to `perf.data` in the current directory.

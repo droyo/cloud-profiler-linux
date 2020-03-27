@@ -36,7 +36,6 @@ var (
 	credsJSON    = flag.String("credentials", "", "service account credentials JSON file")
 	cloudProject = flag.String("project", "", "Google Cloud project ID")
 	service      = flag.String("service", "", "Service name")
-	runForever   = flag.Bool("run-forever", false, "Collect profiles indefinitely according to Cloud Profiler's cadence")
 )
 
 var (
