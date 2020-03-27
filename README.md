@@ -1,8 +1,12 @@
-This is a proof-of-concept agent for the Cloud Profiler[1] that makes
-tunable perf_events[2] profiles available in the Google Cloud console.
-It is a wrapper for the `perf record` command that converts its output
-to the format expected by the cloud profiler and uploads it using the
-credentials provided via command line.
+This is a proof-of-concept agent for the [Cloud
+Profiler](https://cloud.google.com/profiler/) that makes tunable
+[perf_events](https://cloud.google.com/profiler/) profiles available
+in the Google Cloud console.  It is a wrapper for the `perf record`
+command that converts its output to the format expected by the cloud
+profiler and uploads it using the credentials provided via command line.
+The Cloud Profiler UI can then be used to view flame graphs.
+
+![cloud profiler graph](./extra/profiler-flame-graph.png)
 
 The `cloud-profiler-perf-record` command runs forever, collecting
 profiles at the cadence established by the Cloud Profiler service.
@@ -14,8 +18,9 @@ BUILD
 
 bazel build :cloud-profiler-perf-record
 
-The command requires the pprof[1] and perf_to_profile[2] commands to
-be in its $PATH.
+The command requires the [pprof](https://github.com/google/pprof) and
+[perf_to_profile](https://github.com/google/perf_to_profile) commands
+to be in its $PATH.
 
 To create useful traces, the agent requires debug symbols. The agent
 attempts to use the `perf buildid-list` command to discover symbols
@@ -24,13 +29,10 @@ automatically.
 On debian/ubuntu, ensure you have the relevant `-dbgsym` packages
 installed for the applications you want to monitor.
 
-[1]: https://github.com/google/pprof
-[2]: https://github.com/google/perf_to_profile
-
 RUN
 
 `cloud-profiler-perf-record` is configured to run using service account
-credentials[3]. It us run like so:
+[credentials][1]. It us run like so:
 
 	cloud-profiler-perf-record \
 		--credentials path/to/credentials.json \
@@ -42,7 +44,7 @@ using the same service name will get profile requests at a reduced rate
 proportional to the number of agents. If `--service` is not provided,
 the instance's hostname is used.
 
-[3]: https://cloud.google.com/iam/docs/creating-managing-service-account-keys
+[1]: https://cloud.google.com/iam/docs/creating-managing-service-account-keys
 
 USING A CUSTOM PERF COMMAND
 
@@ -60,7 +62,3 @@ be passed to customize the profile.
 
 The only restrictions on the perf command is that it must write its output
 to `perf.data` in the current directory.
-
-[1]: https://cloud.google.com/profiler/
-[2]: http://www.brendangregg.com/perf.html
-[3]: https://cloud.google.com/docs/authentication/production#finding_credentials_automatically
